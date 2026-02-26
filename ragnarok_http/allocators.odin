@@ -1,4 +1,4 @@
-package main
+package ragnarok_http
 
 import "core:mem"
 
