@@ -78,6 +78,20 @@ health_handler :: proc(request: ^Http_Request, response: ^Http_Response, allocat
 	response_set_body_string(response, "OK", "text/plain", allocator)
 }
 
+// TechEmpower-style plaintext handler.
+// Matches: GET /plaintext  →  "Hello, World!"
+plaintext_handler :: proc(request: ^Http_Request, response: ^Http_Response, allocator: mem.Allocator) {
+	response.status = .OK
+	response_set_body_string(response, "Hello, World!", "text/plain; charset=UTF-8", allocator)
+}
+
+// TechEmpower-style JSON handler.
+// Matches: GET /json  →  {"message":"Hello, World!"}
+json_handler :: proc(request: ^Http_Request, response: ^Http_Response, allocator: mem.Allocator) {
+	response.status = .OK
+	response_set_body_string(response, "{\"message\":\"Hello, World!\"}", "application/json; charset=UTF-8", allocator)
+}
+
 not_found_handler :: proc(request: ^Http_Request, response: ^Http_Response, allocator: mem.Allocator) {
 	response.status = .Not_Found
 	response_set_body_string(response, "Not Found", "text/plain", allocator)

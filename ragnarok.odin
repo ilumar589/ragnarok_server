@@ -23,6 +23,10 @@ main :: proc() {
 	http.router_add_route(&server.router, .GET, "/", index_handler)
 	http.router_add_route(&server.router, .POST, "/echo", echo_handler)
 
+	// TechEmpower-style benchmark routes
+	http.router_add_route(&server.router, .GET, "/plaintext", http.plaintext_handler)
+	http.router_add_route(&server.router, .GET, "/json", http.json_handler)
+
 	fmt.printfln("Starting Ragnarok HTTP server on :%d", config.port)
 	http.server_start(&server)
 }
