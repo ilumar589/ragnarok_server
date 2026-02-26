@@ -1,2 +1,6 @@
 ragnarok.exe
 ragnarok_server.exe
+benchmarks.exe
+benchmarks.pdb
+benchmark_report.html
+reports/

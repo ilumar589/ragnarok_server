@@ -4,7 +4,6 @@ import "core:log"
 import "core:mem"
 import "core:nbio"
 import "core:net"
-import "core:os"
 import "core:thread"
 
 // ────────────────────────────────────────────────────
@@ -27,7 +26,7 @@ Server_Config :: struct {
 }
 
 default_server_config :: proc() -> Server_Config {
-	cpu_count := os.get_processor_core_count()
+	cpu_count := _get_cpu_count()
 	workers := max(cpu_count - 1, 1) // reserve 1 core for the I/O thread
 
 	return Server_Config{
