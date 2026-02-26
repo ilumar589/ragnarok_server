@@ -132,8 +132,10 @@ build_file_path :: proc(root, relative: string, allocator: mem.Allocator) -> str
 		clean_root = clean_root[:len(clean_root)-1]
 	}
 	when ODIN_OS == .Windows {
-		rel, _ := strings.replace_all(relative, "/", "\\", allocator)
-		return strings.concatenate({clean_root, "\\", rel}, allocator)
+		rel, was_alloc := strings.replace_all(relative, "/", "\\", allocator)
+		result := strings.concatenate({clean_root, "\\", rel}, allocator)
+		if was_alloc { delete(rel, allocator) }
+		return result
 	} else {
 		return strings.concatenate({clean_root, "/", relative}, allocator)
 	}
