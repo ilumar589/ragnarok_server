@@ -1,6 +1,5 @@
 package ragnarok_http
 
-import "core:fmt"
 import "core:mem"
 import "core:strconv"
 import "core:strings"
@@ -109,11 +108,21 @@ response_serialize :: proc(response: ^Http_Response, allocator: mem.Allocator) -
 	strings.write_string(&b, status_reason(response.status))
 	strings.write_string(&b, "\r\n")
 
-	// Auto-add Content-Length
+	// Auto-add Content-Length (skip if already set, e.g. for sendfile responses
+	// where the handler sets Content-Length to the file size but body is nil)
 	body_len := len(response.body) if response.body != nil else 0
-	content_length_buf: [20]u8
-	cl_str := strconv.write_int(content_length_buf[:], i64(body_len), 10)
-	response_set_header(response, "Content-Length", cl_str, allocator)
+	has_content_length := false
+	for h in response.headers {
+		if strings.equal_fold(h.name, "Content-Length") {
+			has_content_length = true
+			break
+		}
+	}
+	if !has_content_length {
+		content_length_buf: [20]u8
+		cl_str := strconv.write_int(content_length_buf[:], i64(body_len), 10)
+		response_set_header(response, "Content-Length", cl_str, allocator)
+	}
 
 	// Auto-add Server header
 	response_set_header(response, "Server", "Ragnarok", allocator)

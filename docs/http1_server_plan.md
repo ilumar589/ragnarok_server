@@ -263,23 +263,21 @@ Main Thread (Event Loop)
 
 ### Phase 8: Performance Optimizations
 
-- [ ] **8.1 — Structure of Arrays (SOA) for connection pool** _(stretch goal)_
-  - If managing many concurrent connections, use SOA layout:
-    ```odin
-    Connection_Pool :: struct {
-        sockets:    [MAX_CONNECTIONS]net.TCP_Socket,
-        endpoints:  [MAX_CONNECTIONS]net.Endpoint,
-        recv_bufs:  [MAX_CONNECTIONS][8192]u8,
-        recv_lens:  [MAX_CONNECTIONS]int,
-        alive:      [MAX_CONNECTIONS]bool,
-        count:      int,
-    }
-    ```
-  - Better cache behavior when iterating over one field across all connections
+- [x] **8.1 — Structure of Arrays (SOA) for connection pool** _(stretch goal)_
+  - Implemented using Odin's native `#soa[]Connection` slice — compiler transforms each field
+    into a contiguous array automatically
+  - `Connection_Pool` holds `#soa[]Connection` + separate `[]Request_Arena` (LLVM GEP workaround)
+  - LIFO free-stack for O(1) slot acquire/release, no per-connection heap alloc
+  - `Conn_Ref` handles (pool + slot) passed to all async callbacks
+  - All pool operations (acquire/release) run on the I/O thread — no synchronisation needed
 
-- [ ] **8.2 — sendfile for static files** _(stretch goal)_
-  - Use `nbio.sendfile` for zero-copy file serving (stretch goal)
-  - Opens file with `nbio.open_sync`, then sends via `nbio.sendfile` to the TCP socket
+- [x] **8.2 — sendfile for static files** _(stretch goal)_
+  - Zero-copy file serving via `nbio.sendfile_poly` on the I/O thread
+  - Two-phase send: headers via `nbio.send_poly`, then file via `nbio.sendfile_poly`
+  - File opened twice: `os.open` for `Content-Length` (file_size), then `nbio.open_sync` for IOCP handle
+  - `static_root` config (default empty = disabled); falls back to static serving when no route matches
+  - MIME type mapping (30+ types), path traversal protection, `index.html` fallback
+  - `pool.conns[s].sendfile_pending` flag chains sendfile after header send completes
 
 - [x] **8.3 — Compile with LTO**
   - Build with `-lto:thin` for cross-package inlining and dead code elimination

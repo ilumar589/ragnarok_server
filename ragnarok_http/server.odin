@@ -12,17 +12,18 @@ import "core:thread"
 // ────────────────────────────────────────────────────
 
 Server_Config :: struct {
-	host:               net.IP4_Address,
-	port:               int,
-	max_connections:     int,
-	worker_count:        int,
-	read_buffer_size:    int,
-	request_arena_size:  int,
-	max_headers:         int,
-	max_header_size:     int,
-	max_body_size:       int,
+	host:                 net.IP4_Address,
+	port:                 int,
+	max_connections:       int,
+	worker_count:          int,
+	read_buffer_size:      int,
+	request_arena_size:    int,
+	max_headers:           int,
+	max_header_size:       int,
+	max_body_size:         int,
 	max_requests_per_conn: int,
-	idle_timeout_secs:   int,
+	idle_timeout_secs:     int,
+	static_root:           string, // root directory for static file serving (empty = disabled)
 }
 
 default_server_config :: proc() -> Server_Config {
@@ -49,13 +50,13 @@ default_server_config :: proc() -> Server_Config {
 // ────────────────────────────────────────────────────
 
 Server :: struct {
-	config:             Server_Config,
-	socket:             net.TCP_Socket,
-	router:             Router,
-	workers:            thread.Pool,
-	loop:               ^nbio.Event_Loop, // main thread event loop reference for worker→IO queuing
-	running:            bool,
-	active_connections: int, // atomic counter for current connections
+	config:  Server_Config,
+	socket:  net.TCP_Socket,
+	router:  Router,
+	workers: thread.Pool,
+	loop:    ^nbio.Event_Loop, // main thread event loop reference for worker→IO queuing
+	running: bool,
+	pool:    Connection_Pool,  // SOA connection pool (pre-allocated, no per-connection heap allocs)
 }
 
 // ────────────────────────────────────────────────────
@@ -82,6 +83,13 @@ server_start :: proc(server: ^Server) {
 
 	// Store the event loop reference so worker threads can queue sends back
 	server.loop = nbio.current_thread_event_loop()
+
+	// Initialize SOA connection pool
+	if !pool_init(&server.pool, server.config.max_connections, server, context.allocator) {
+		log.error("Failed to initialize connection pool")
+		return
+	}
+	log.infof("Connection pool initialized: %d slots", server.config.max_connections)
 
 	// Initialize thread pool for CPU-bound request processing
 	thread.pool_init(&server.workers, context.allocator, server.config.worker_count)
@@ -114,6 +122,7 @@ server_start :: proc(server: ^Server) {
 	server.running = false
 	thread.pool_finish(&server.workers)
 	thread.pool_destroy(&server.workers)
+	pool_destroy(&server.pool, context.allocator)
 	log.info("Server shut down")
 }
 

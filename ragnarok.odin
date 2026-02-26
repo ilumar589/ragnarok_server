@@ -11,6 +11,7 @@ main :: proc() {
 	context.logger = log.create_console_logger(.Debug)
 
 	config := http.default_server_config()
+	config.static_root = "static" // serve files from ./static/ directory
 
 	server: http.Server
 	if !http.server_init(&server, config) {
