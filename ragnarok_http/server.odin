@@ -4,6 +4,7 @@ import "core:log"
 import "core:mem"
 import "core:nbio"
 import "core:net"
+import "core:os"
 import "core:thread"
 
 // ────────────────────────────────────────────────────
@@ -25,11 +26,14 @@ Server_Config :: struct {
 }
 
 default_server_config :: proc() -> Server_Config {
+	cpu_count := os.get_processor_core_count()
+	workers := max(cpu_count - 1, 1) // reserve 1 core for the I/O thread
+
 	return Server_Config{
 		host               = nbio.IP4_Any,
 		port               = 8080,
 		max_connections     = 1024,
-		worker_count        = 4,
+		worker_count        = workers,
 		read_buffer_size    = 8192,
 		request_arena_size  = 8192,
 		max_headers         = 64,
@@ -45,12 +49,13 @@ default_server_config :: proc() -> Server_Config {
 // ────────────────────────────────────────────────────
 
 Server :: struct {
-	config:  Server_Config,
-	socket:  net.TCP_Socket,
-	router:  Router,
-	workers: thread.Pool,
-	loop:    ^nbio.Event_Loop, // main thread event loop reference for worker→IO queuing
-	running: bool,
+	config:             Server_Config,
+	socket:             net.TCP_Socket,
+	router:             Router,
+	workers:            thread.Pool,
+	loop:               ^nbio.Event_Loop, // main thread event loop reference for worker→IO queuing
+	running:            bool,
+	active_connections: int, // atomic counter for current connections
 }
 
 // ────────────────────────────────────────────────────

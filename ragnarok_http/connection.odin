@@ -7,6 +7,7 @@ import "core:nbio"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:thread"
 import "core:time"
 
@@ -42,6 +43,15 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 
 	// Re-register accept for the next connection
 	nbio.accept_poly(op.accept.socket, server, on_accept)
+
+	// Enforce max connections limit
+	current := sync.atomic_add(&server.active_connections, 1)
+	if current >= server.config.max_connections {
+		sync.atomic_sub(&server.active_connections, 1)
+		log.warnf("Max connections reached (%d), rejecting new connection", server.config.max_connections)
+		nbio.close(op.accept.client)
+		return
+	}
 
 	// Set TCP_NODELAY on the accepted socket to disable Nagle's algorithm
 	net.set_option(op.accept.client, .TCP_Nodelay, true)
@@ -109,8 +119,16 @@ on_recv :: proc(op: ^nbio.Operation, conn: ^Connection) {
 
 	conn.recv_len += op.recv.received
 
-	// Try to parse the request
+	// Check total header size limit before parsing attempt
 	data := conn.recv_buf[:conn.recv_len]
+	if conn.recv_len > conn.server.config.max_header_size {
+		// If we haven't found the end of headers yet and we're over the limit, reject
+		header_end := find_header_end(data)
+		if header_end < 0 {
+			send_error_response(conn, .Bad_Request)
+			return
+		}
+	}
 
 	// Look for end of headers (\r\n\r\n)
 	header_end := find_header_end(data)
@@ -217,6 +235,7 @@ process_request_task :: proc(task: thread.Task) {
 		log.error("Failed to serialize response")
 		request_arena_destroy(&conn.request_arena, context.allocator)
 		// Queue close on I/O thread
+		sync.atomic_sub(&conn.server.active_connections, 1)
 		nbio.close(conn.socket, l = conn.server.loop)
 		free(conn)
 		return
@@ -251,6 +270,7 @@ queue_error_response :: proc(conn: ^Connection, status: Http_Status) {
 	// Build a minimal error response
 	error_resp_buf := make([]u8, 256)
 	if error_resp_buf == nil {
+		sync.atomic_sub(&conn.server.active_connections, 1)
 		nbio.close(conn.socket, l = conn.server.loop)
 		free(conn)
 		return
@@ -347,6 +367,7 @@ connection_close :: proc(conn: ^Connection) {
 		return
 	}
 	log.debugf("Closing connection to %v (served %d requests)", conn.remote_endpoint, conn.request_count)
+	sync.atomic_sub(&conn.server.active_connections, 1)
 	request_arena_destroy(&conn.request_arena, context.allocator)
 	nbio.close(conn.socket)
 	free(conn)

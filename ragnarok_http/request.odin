@@ -84,6 +84,11 @@ parse_request :: proc(
 ) -> bool {
 	text := string(data)
 
+	// ── Validate total header size ──
+	if len(data) > config.max_header_size {
+		return false
+	}
+
 	// ── Parse request line: METHOD SP URI SP HTTP/Version CRLF ──
 	request_line_end := strings.index(text, "\r\n")
 	if request_line_end < 0 {
@@ -110,6 +115,12 @@ parse_request :: proc(
 		return false
 	}
 	request.uri = rest[:sp2]
+
+	// Reject excessively long URIs (common attack vector)
+	if len(request.uri) > 8192 {
+		return false
+	}
+
 	version_str := rest[sp2 + 1:]
 
 	switch version_str {
@@ -168,6 +179,11 @@ parse_request :: proc(
 		name := strings.trim_space(line[:colon])
 		value := strings.trim_space(line[colon + 1:])
 
+		// Reject empty header names
+		if len(name) == 0 {
+			return false
+		}
+
 		append(&parsed_headers, Header{name = name, value = value})
 		header_count += 1
 
@@ -188,8 +204,10 @@ parse_request :: proc(
 
 		if lower_name == "content-length" {
 			cl, ok := strconv.parse_int(h.value)
-			if ok {
+			if ok && cl >= 0 {
 				request.content_length = cl
+			} else if ok && cl < 0 {
+				return false // Reject negative Content-Length
 			}
 		} else if lower_name == "connection" {
 			lower_value := strings.to_lower(h.value, allocator)
