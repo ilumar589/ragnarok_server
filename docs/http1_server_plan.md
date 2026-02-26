@@ -52,7 +52,7 @@ Main Thread (Event Loop)
 
 ### Phase 1: Project Skeleton & TCP Accept Loop
 
-- [ ] **1.1 — Project structure setup**
+- [x] **1.1 — Project structure setup**
   - Create the following source files:
     - `ragnarok.odin` — entry point, server bootstrap
     - `server.odin` — server config, lifecycle (init, start, shutdown)
@@ -63,32 +63,34 @@ Main Thread (Event Loop)
     - `allocators.odin` — arena and fixed-buffer allocator helpers
   - All files in `package main`
 
-- [ ] **1.2 — Server config struct**
+- [x] **1.2 — Server config struct**
   - Define `Server_Config` with: host, port, max_connections, worker_count, read_buffer_size, request_arena_size
   - All sizes should have sensible defaults
 
-- [ ] **1.3 — Event loop bootstrap**
+- [x] **1.3 — Event loop bootstrap**
   - In `main`, call `nbio.acquire_thread_event_loop()`
   - Call `nbio.listen_tcp({nbio.IP4_Any, port})` to bind and listen
   - Call `nbio.accept_poly(server_socket, &workers, on_accept)` to start accepting
   - Call `nbio.run()` to block the main thread on the event loop
 
-- [ ] **1.4 — Thread pool initialization**
+- [x] **1.4 — Thread pool initialization**
   - Use `thread.Pool` with configurable worker count (default: number of CPU cores)
   - Initialize before starting the event loop
   - Each worker task gets the accepted client socket + server context
+  - Pattern: main I/O thread (accept/recv/send) + worker pool (parse/route/handle/serialize)
+  - Workers queue sends back to main event loop via `l = conn.server.loop`
 
-- [ ] **1.5 — Accept callback and connection dispatch**
+- [x] **1.5 — Accept callback and connection dispatch**
   - In `on_accept`: re-register accept for next connection, dispatch work to thread pool
   - Pass `Connection` struct (client socket, remote endpoint, event loop ref) to worker
 
 ### Phase 2: Memory Management
 
-- [ ] **2.1 — Explicit allocator parameter convention**
+- [x] **2.1 — Explicit allocator parameter convention**
   - Every procedure that allocates takes an `allocator: mem.Allocator` as its last parameter
   - No reliance on implicit `context.allocator` — always explicit for visibility
 
-- [ ] **2.2 — Request arena allocator**
+- [x] **2.2 — Request arena allocator**
   - Each request gets its own `mem.Arena` backed by a chunk from the general-purpose allocator
   - Default chunk size: 8 KiB (configurable via `Server_Config.request_arena_size`)
   - Arena is initialized at the start of request handling and freed entirely when the response is sent
@@ -101,13 +103,13 @@ Main Thread (Event Loop)
     // ... all request parsing and response building uses request_allocator ...
     ```
 
-- [ ] **2.3 — Fixed-buffer allocators for hot paths**
+- [x] **2.3 — Fixed-buffer allocators for hot paths**
   - Use `mem.Arena` initialized with a stack-local fixed buffer (`[4096]u8`) for small, bounded allocations (e.g., header name/value scratch space, small string building)
   - Falls back to arena if fixed buffer is exhausted (arena supports this with `mem.arena_init` on a fixed `[]u8`)
 
 ### Phase 3: HTTP/1.1 Request Parsing
 
-- [ ] **3.1 — Request types**
+- [x] **3.1 — Request types**
   ```odin
   Http_Method :: enum {
       GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE, CONNECT,
@@ -136,23 +138,23 @@ Main Thread (Event Loop)
   }
   ```
 
-- [ ] **3.2 — Request-line parser**
+- [x] **3.2 — Request-line parser**
   - Parse: `METHOD SP Request-URI SP HTTP-Version CRLF`
   - Validate method, extract URI, parse version
   - All strings are slices into the receive buffer (zero-copy where possible)
 
-- [ ] **3.3 — Header parser**
+- [x] **3.3 — Header parser**
   - Parse: `Field-Name ":" OWS Field-Value OWS CRLF` repeated until empty line `CRLF`
   - Limit max headers (default: 64)
   - Limit max header size (default: 8 KiB)
   - Extract `Content-Length`, `Connection` (keep-alive / close), `Host`, `Transfer-Encoding`
 
-- [ ] **3.4 — Body reading**
+- [x] **3.4 — Body reading**
   - If `Content-Length` present: read exactly that many bytes
   - If `Transfer-Encoding: chunked`: implement chunked decoding (stretch goal — skip for MVP)
   - For MVP: support `Content-Length`-based body reading only
 
-- [ ] **3.5 — Incremental receive buffer**
+- [x] **3.5 — Incremental receive buffer**
   - Recv into a fixed buffer (default: 8 KiB)
   - If request is incomplete, continue receiving
   - Detect end of headers (`\r\n\r\n`) then read body based on Content-Length
@@ -160,7 +162,7 @@ Main Thread (Event Loop)
 
 ### Phase 4: HTTP/1.1 Response Building & Sending
 
-- [ ] **4.1 — Response types**
+- [x] **4.1 — Response types**
   ```odin
   Http_Status :: enum u16 {
       OK                    = 200,
@@ -181,20 +183,20 @@ Main Thread (Event Loop)
   }
   ```
 
-- [ ] **4.2 — Response serialization**
+- [x] **4.2 — Response serialization**
   - Build status line: `HTTP/1.1 STATUS_CODE REASON_PHRASE\r\n`
   - Append headers: auto-add `Content-Length`, `Date`, `Connection`, `Server: Ragnarok`
   - Append `\r\n` separator, then body
   - Serialize into a contiguous `[]u8` buffer from the request arena
 
-- [ ] **4.3 — Send response via nbio**
+- [x] **4.3 — Send response via nbio**
   - Use `nbio.send` with the serialized buffer
   - On completion callback: if keep-alive, re-register recv for next request; otherwise close socket
   - Use `nbio.close` to clean up the socket when done
 
 ### Phase 5: Router & Handler System
 
-- [ ] **5.1 — Route registration**
+- [x] **5.1 — Route registration**
   ```odin
   Handler_Proc :: proc(request: ^Http_Request, response: ^Http_Response, allocator: mem.Allocator)
 
@@ -208,19 +210,19 @@ Main Thread (Event Loop)
   - Support exact path matching for MVP
   - Prefix/pattern matching as stretch goal
 
-- [ ] **5.2 — Route dispatch**
+- [x] **5.2 — Route dispatch**
   - Match incoming request method + path against registered routes
   - If no match: 404 Not Found
   - If method mismatch on known path: 405 Method Not Allowed
 
-- [ ] **5.3 — Default handlers**
+- [x] **5.3 — Default handlers**
   - 404 handler (plain text "Not Found")
   - 500 handler (plain text "Internal Server Error")
   - Health check endpoint: `GET /health` → 200 "OK"
 
 ### Phase 6: Connection Lifecycle & Keep-Alive
 
-- [ ] **6.1 — Connection struct**
+- [x] **6.1 — Connection struct**
   ```odin
   Connection :: struct {
       socket:          net.TCP_Socket,
@@ -232,37 +234,37 @@ Main Thread (Event Loop)
   }
   ```
 
-- [ ] **6.2 — Keep-alive support**
+- [x] **6.2 — Keep-alive support**
   - Default: keep-alive for HTTP/1.1, close for HTTP/1.0
   - Respect `Connection: close` / `Connection: keep-alive` headers
   - After sending response, if keep-alive: reset recv buffer, re-register recv
   - Max requests per connection (configurable, default: 100)
   - Idle timeout per connection (configurable, default: 30s)
 
-- [ ] **6.3 — Graceful connection close**
+- [x] **6.3 — Graceful connection close**
   - On error or connection close: free connection resources
   - Use `nbio.close` to close the socket asynchronously
 
 ### Phase 7: Error Handling & Robustness
 
-- [ ] **7.1 — Malformed request handling**
+- [x] **7.1 — Malformed request handling**
   - If request line is invalid → 400 Bad Request, close connection
   - If headers exceed limits → 400 Bad Request
   - If body exceeds max body size (configurable) → 413 Payload Too Large
 
-- [ ] **7.2 — Timeout handling**
+- [x] **7.2 — Timeout handling**
   - Use `nbio` timeout parameters on recv/send operations
   - Read timeout: if headers not received within N seconds → 408 Request Timeout
   - Write timeout: if response send stalls → close connection
 
-- [ ] **7.3 — Logging**
+- [x] **7.3 — Logging**
   - Log accepted connections, request method/path, response status, timing
   - Use `core:log` with context-based logger
   - Access log format: `[timestamp] remote_ip "METHOD /path" status_code duration_ms`
 
 ### Phase 8: Performance Optimizations
 
-- [ ] **8.1 — Structure of Arrays (SOA) for connection pool**
+- [ ] **8.1 — Structure of Arrays (SOA) for connection pool** _(stretch goal)_
   - If managing many concurrent connections, use SOA layout:
     ```odin
     Connection_Pool :: struct {
@@ -276,7 +278,7 @@ Main Thread (Event Loop)
     ```
   - Better cache behavior when iterating over one field across all connections
 
-- [ ] **8.2 — sendfile for static files**
+- [ ] **8.2 — sendfile for static files** _(stretch goal)_
   - Use `nbio.sendfile` for zero-copy file serving (stretch goal)
   - Opens file with `nbio.open_sync`, then sends via `nbio.sendfile` to the TCP socket
 
@@ -284,18 +286,18 @@ Main Thread (Event Loop)
   - Build with `-lto:thin` for cross-package inlining and dead code elimination
   - Build command: `odin build . -opt:speed -lto:thin`
 
-- [ ] **8.4 — TCP_NODELAY**
-  - Ensure TCP_NODELAY is set on accepted sockets (Odin defaults to true via `ODIN_NET_TCP_NODELAY_DEFAULT`)
-  - Confirm via `net.set_option(socket, .TCP_Nodelay, true)`
+- [x] **8.4 — TCP_NODELAY**
+  - Ensure TCP_NODELAY is set on accepted sockets
+  - Set via `net.set_option(socket, .TCP_Nodelay, true)` in `on_accept`
 
 ### Phase 9: Testing & Validation
 
-- [ ] **9.1 — Manual smoke tests**
+- [x] **9.1 — Manual smoke tests**
   - Start server, curl basic endpoints
   - `curl http://localhost:8080/health`
   - `curl -X POST -d "hello" http://localhost:8080/echo`
 
-- [ ] **9.2 — Keep-alive test**
+- [x] **9.2 — Keep-alive test**
   - Use `curl --keepalive` or a persistent HTTP client
   - Verify multiple requests on the same TCP connection
 

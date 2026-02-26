@@ -5,6 +5,10 @@ import "core:log"
 import "core:mem"
 import "core:nbio"
 import "core:net"
+import "core:strconv"
+import "core:strings"
+import "core:thread"
+import "core:time"
 
 // ────────────────────────────────────────────────────
 // Connection state
@@ -21,6 +25,7 @@ Connection :: struct {
 	request_count:   int,
 	server:          ^Server,
 	request_arena:   Request_Arena,
+	recv_start:      time.Time, // when we started waiting for data (for access log timing)
 }
 
 // ────────────────────────────────────────────────────
@@ -37,6 +42,9 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 
 	// Re-register accept for the next connection
 	nbio.accept_poly(op.accept.socket, server, on_accept)
+
+	// Set TCP_NODELAY on the accepted socket to disable Nagle's algorithm
+	net.set_option(op.accept.client, .TCP_Nodelay, true)
 
 	// Create a new connection
 	conn := new(Connection)
@@ -70,11 +78,22 @@ connection_start_recv :: proc(conn: ^Connection) {
 		connection_close(conn)
 		return
 	}
+	conn.recv_start = time.now()
 	bufs := [][]u8{remaining}
-	nbio.recv_poly(conn.socket, bufs, conn, on_recv)
+	// Apply idle timeout to recv so stalled connections get cleaned up
+	recv_timeout := time.Duration(conn.server.config.idle_timeout_secs) * time.Second
+	nbio.recv_poly(conn.socket, bufs, conn, on_recv, timeout = recv_timeout)
 }
 
 on_recv :: proc(op: ^nbio.Operation, conn: ^Connection) {
+	// Check for timeout
+	recv_err, is_tcp_err := op.recv.err.(net.TCP_Recv_Error)
+	if is_tcp_err && recv_err == .Timeout {
+		log.debugf("Recv timeout from %v", conn.remote_endpoint)
+		send_error_response(conn, .Request_Timeout)
+		return
+	}
+
 	if op.recv.err != nil {
 		log.debugf("Recv error from %v: %v", conn.remote_endpoint, op.recv.err)
 		connection_close(conn)
@@ -101,13 +120,53 @@ on_recv :: proc(op: ^nbio.Operation, conn: ^Connection) {
 		return
 	}
 
+	// Check if body is complete before dispatching to worker
 	header_section := data[:header_end]
 	body_start := header_end + 4 // skip \r\n\r\n
 
-	// Initialize request arena
+	// Quick scan for Content-Length to check if we have the full body
+	content_length := scan_content_length(header_section)
+	if content_length > 0 {
+		if content_length > conn.server.config.max_body_size {
+			send_error_response(conn, .Payload_Too_Large)
+			return
+		}
+		body_available := conn.recv_len - body_start
+		if body_available < content_length {
+			// Need more body data
+			if body_start + content_length > RECV_BUF_SIZE {
+				send_error_response(conn, .Payload_Too_Large)
+				return
+			}
+			connection_start_recv(conn)
+			return
+		}
+	}
+
+	// Full request received — dispatch CPU work (parse/route/handle/serialize) to worker thread
+	thread.pool_add_task(&conn.server.workers, context.allocator, process_request_task, conn)
+}
+
+// ────────────────────────────────────────────────────
+// Worker thread task — CPU-bound request processing
+// ────────────────────────────────────────────────────
+
+// Runs on a worker thread. Parses the request, routes, runs the handler,
+// serializes the response, then queues the send back to the main event loop.
+process_request_task :: proc(task: thread.Task) {
+	conn := (^Connection)(task.data)
+	data := conn.recv_buf[:conn.recv_len]
+
+	header_end := find_header_end(data)
+	// header_end is guaranteed >= 0 since we checked before dispatching
+	header_section := data[:header_end]
+	body_start := header_end + 4
+
+	// Initialize request arena (heap alloc on this worker thread)
 	if err := request_arena_init(&conn.request_arena, conn.server.config.request_arena_size, context.allocator); err != nil {
 		log.error("Failed to allocate request arena")
-		send_error_response(conn, .Internal_Server_Error)
+		// Queue error response send back to the I/O thread
+		queue_error_response(conn, .Internal_Server_Error)
 		return
 	}
 
@@ -117,29 +176,12 @@ on_recv :: proc(op: ^nbio.Operation, conn: ^Connection) {
 	request: Http_Request
 	parse_ok := parse_request(&request, header_section, conn.server.config, arena_alloc)
 	if !parse_ok {
-		send_error_response(conn, .Bad_Request)
+		queue_error_response(conn, .Bad_Request)
 		return
 	}
 
-	// Check Content-Length for body
-	body_available := conn.recv_len - body_start
+	// Attach body if present
 	if request.content_length > 0 {
-		if request.content_length > conn.server.config.max_body_size {
-			send_error_response(conn, .Payload_Too_Large)
-			return
-		}
-
-		if body_available < request.content_length {
-			// Need more body data — continue receiving
-			// For MVP, we only support bodies that fit in the recv buffer
-			if body_start + request.content_length > RECV_BUF_SIZE {
-				send_error_response(conn, .Payload_Too_Large)
-				return
-			}
-			connection_start_recv(conn)
-			return
-		}
-
 		request.body = data[body_start:body_start + request.content_length]
 	}
 
@@ -147,7 +189,6 @@ on_recv :: proc(op: ^nbio.Operation, conn: ^Connection) {
 	conn.keep_alive = request.keep_alive
 	conn.request_count += 1
 
-	// Check max requests per connection
 	if conn.request_count >= conn.server.config.max_requests_per_conn {
 		conn.keep_alive = false
 	}
@@ -160,31 +201,94 @@ on_recv :: proc(op: ^nbio.Operation, conn: ^Connection) {
 	if handler != nil {
 		handler(&request, &response, arena_alloc)
 	} else {
-		// 404 Not Found
 		not_found_handler(&request, &response, arena_alloc)
 	}
 
-	// Ensure Connection header reflects keep-alive state
+	// Connection header
 	if !conn.keep_alive {
 		response_set_header(&response, "Connection", "close", arena_alloc)
 	} else {
 		response_set_header(&response, "Connection", "keep-alive", arena_alloc)
 	}
 
-	// Serialize and send
+	// Serialize response
 	send_buf := response_serialize(&response, arena_alloc)
 	if send_buf == nil {
 		log.error("Failed to serialize response")
-		connection_close(conn)
+		request_arena_destroy(&conn.request_arena, context.allocator)
+		// Queue close on I/O thread
+		nbio.close(conn.socket, l = conn.server.loop)
+		free(conn)
 		return
 	}
 
+	// Access log: method, path, status, duration
+	duration := time.since(conn.recv_start)
+	duration_ms := time.duration_milliseconds(duration)
+	log.infof("%v \"%s %s\" %d %.1fms",
+		conn.remote_endpoint,
+		method_to_string(request.method),
+		request.path,
+		int(response.status),
+		duration_ms,
+	)
+
+	// Queue the send operation back to the main I/O event loop
 	bufs := [][]u8{send_buf}
-	nbio.send_poly(conn.socket, bufs, conn, on_send, all = true)
+	send_timeout := time.Duration(conn.server.config.idle_timeout_secs) * time.Second
+	nbio.send_poly(conn.socket, bufs, conn, on_send, all = true, timeout = send_timeout, l = conn.server.loop)
+}
+
+// Queue an error response send from a worker thread back to the I/O event loop.
+queue_error_response :: proc(conn: ^Connection, status: Http_Status) {
+	// Free any in-progress request arena
+	request_arena_destroy(&conn.request_arena, context.allocator)
+
+	// Allocate a small buffer for the error response that outlives this proc.
+	// We use heap because the send is async on the I/O thread.
+	error_body := status_reason(status)
+
+	// Build a minimal error response
+	error_resp_buf := make([]u8, 256)
+	if error_resp_buf == nil {
+		nbio.close(conn.socket, l = conn.server.loop)
+		free(conn)
+		return
+	}
+
+	// Store the error response buffer on the connection's request_arena backing
+	// so it gets freed in on_send → connection_close
+	conn.request_arena.backing = error_resp_buf
+
+	n := format_error_response(error_resp_buf, status, error_body)
+	conn.keep_alive = false
+
+	bufs := [][]u8{error_resp_buf[:n]}
+	nbio.send_poly(conn.socket, bufs, conn, on_send, all = true, l = conn.server.loop)
+}
+
+// Format a minimal HTTP error response into a buffer. Returns bytes written.
+format_error_response :: proc(buf: []u8, status: Http_Status, body: string) -> int {
+	// Build: "HTTP/1.1 STATUS REASON\r\nContent-Length: N\r\nContent-Type: text/plain\r\nConnection: close\r\nServer: Ragnarok\r\n\r\nbody"
+	i := 0
+	i += copy_to(buf[i:], "HTTP/1.1 ")
+	i += write_int_to_buf(buf[i:], int(status))
+	i += copy_to(buf[i:], " ")
+	i += copy_to(buf[i:], status_reason(status))
+	i += copy_to(buf[i:], "\r\n")
+	i += copy_to(buf[i:], "Content-Length: ")
+	i += write_int_to_buf(buf[i:], len(body))
+	i += copy_to(buf[i:], "\r\n")
+	i += copy_to(buf[i:], "Content-Type: text/plain\r\n")
+	i += copy_to(buf[i:], "Connection: close\r\n")
+	i += copy_to(buf[i:], "Server: Ragnarok\r\n")
+	i += copy_to(buf[i:], "\r\n")
+	i += copy_to(buf[i:], body)
+	return i
 }
 
 // ────────────────────────────────────────────────────
-// Send flow
+// Send flow (runs on main I/O thread via callback)
 // ────────────────────────────────────────────────────
 
 on_send :: proc(op: ^nbio.Operation, conn: ^Connection) {
@@ -207,35 +311,30 @@ on_send :: proc(op: ^nbio.Operation, conn: ^Connection) {
 }
 
 // ────────────────────────────────────────────────────
-// Error response helper
+// Error response helper (I/O thread context)
 // ────────────────────────────────────────────────────
 
+// Sends an error response from the I/O thread (e.g. recv timeout, body too large).
+// Uses a heap-allocated buffer since nbio.send is async.
 send_error_response :: proc(conn: ^Connection, status: Http_Status) {
-	// Use a small stack-local arena for error responses
-	scratch_buf: [2048]u8
-	scratch_arena: mem.Arena
-	mem.arena_init(&scratch_arena, scratch_buf[:])
-	scratch := mem.arena_allocator(&scratch_arena)
+	// Free any request arena that might have been initialized
+	request_arena_destroy(&conn.request_arena, context.allocator)
 
-	response := Http_Response{}
-	response.headers = make([dynamic]Header, 0, 8, scratch)
-	response.status = status
-	response.body = transmute([]u8)status_reason(status)
-	response_set_header(&response, "Content-Type", "text/plain", scratch)
-	response_set_header(&response, "Connection", "close", scratch)
+	error_body := status_reason(status)
 
-	send_buf := response_serialize(&response, scratch)
-	if send_buf == nil {
+	error_resp_buf := make([]u8, 256)
+	if error_resp_buf == nil {
 		connection_close(conn)
 		return
 	}
 
+	// Store the buffer on the request_arena backing so it gets freed in on_send
+	conn.request_arena.backing = error_resp_buf
+
+	n := format_error_response(error_resp_buf, status, error_body)
 	conn.keep_alive = false
 
-	// Free any request arena that might have been initialized
-	request_arena_destroy(&conn.request_arena, context.allocator)
-
-	bufs := [][]u8{send_buf}
+	bufs := [][]u8{error_resp_buf[:n]}
 	nbio.send_poly(conn.socket, bufs, conn, on_send, all = true)
 }
 
@@ -268,4 +367,54 @@ find_header_end :: proc(data: []u8) -> int {
 		}
 	}
 	return -1
+}
+
+// Quick scan for Content-Length value in raw header bytes without full parsing.
+// Returns 0 if not found or invalid.
+scan_content_length :: proc(header_data: []u8) -> int {
+	text := string(header_data)
+	// Search for Content-Length header (case-insensitive search for common casing)
+	for line in strings.split_lines_iterator(&text) {
+		if len(line) > 16 && (line[0] == 'C' || line[0] == 'c') {
+			lower := strings.to_lower(line[:16], context.temp_allocator)
+			if strings.has_prefix(lower, "content-length:") {
+				val_str := strings.trim_space(line[15:])
+				cl, ok := strconv.parse_int(val_str)
+				if ok {
+					return cl
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// Copy a string into a byte buffer. Returns number of bytes written.
+copy_to :: proc(dst: []u8, src: string) -> int {
+	n := min(len(dst), len(src))
+	copy(dst[:n], transmute([]u8)src[:n])
+	return n
+}
+
+// Write an integer into a byte buffer as decimal text. Returns number of bytes written.
+write_int_to_buf :: proc(dst: []u8, value: int) -> int {
+	tmp: [20]u8
+	s := strconv.write_int(tmp[:], i64(value), 10)
+	return copy_to(dst, s)
+}
+
+// Convert an Http_Method enum to its string representation.
+method_to_string :: proc(method: Http_Method) -> string {
+	switch method {
+	case .GET:     return "GET"
+	case .HEAD:    return "HEAD"
+	case .POST:    return "POST"
+	case .PUT:     return "PUT"
+	case .DELETE:  return "DELETE"
+	case .PATCH:   return "PATCH"
+	case .OPTIONS: return "OPTIONS"
+	case .TRACE:   return "TRACE"
+	case .CONNECT: return "CONNECT"
+	}
+	return "UNKNOWN"
 }

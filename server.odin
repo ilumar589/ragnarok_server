@@ -49,6 +49,7 @@ Server :: struct {
 	socket:  net.TCP_Socket,
 	router:  Router,
 	workers: thread.Pool,
+	loop:    ^nbio.Event_Loop, // main thread event loop reference for worker→IO queuing
 	running: bool,
 }
 
@@ -74,6 +75,14 @@ server_start :: proc(server: ^Server) {
 	}
 	defer nbio.release_thread_event_loop()
 
+	// Store the event loop reference so worker threads can queue sends back
+	server.loop = nbio.current_thread_event_loop()
+
+	// Initialize thread pool for CPU-bound request processing
+	thread.pool_init(&server.workers, context.allocator, server.config.worker_count)
+	thread.pool_start(&server.workers)
+	log.infof("Started %d worker threads", server.config.worker_count)
+
 	// Bind and listen
 	endpoint := net.Endpoint{
 		address = server.config.host,
@@ -98,6 +107,8 @@ server_start :: proc(server: ^Server) {
 	}
 
 	server.running = false
+	thread.pool_finish(&server.workers)
+	thread.pool_destroy(&server.workers)
 	log.info("Server shut down")
 }
 
